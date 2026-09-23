@@ -762,7 +762,7 @@ Four gaps. None of them is a feature, and each is a reason to distrust the plugi
   CRLF and `fenced` splits on `\n`, so every line keeps a `\r`. `fenced` splits on `/\r?\n/`, and
   `.gitattributes` (`* text=auto eol=lf`, `*.png binary`) keeps the checkout LF everywhere. The index was
   LF already, so no blob changes.
-- `.github/workflows/check.yml`: on push and pull request, matrix `ubuntu-latest`, `macos-latest`,
+- `.github/workflows/check.yml`: on a push to any branch and on pull requests, matrix `ubuntu-latest`, `macos-latest`,
   `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `actions/setup-node`, `npm i -g
   @anthropic-ai/claude-code@2.1.280`, then `bash scripts/check.sh` (`shell: bash`, so Windows runs it under
   Git Bash), then `scripts/appendix-a.ts`, which must print `IDENTICAL`. The pin is the release the suite

@@ -1,8 +1,8 @@
 name: check
 
 on:
+  # Every branch: a fork's feature branch is checked before its pull request is opened.
   push:
-    branches: [main]
   pull_request:
 
 jobs:
