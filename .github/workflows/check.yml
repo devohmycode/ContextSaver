@@ -23,5 +23,5 @@ jobs:
       # validate, typecheck and the plugin's tests: none of them reaches the network or needs a key.
       - run: bash scripts/check.sh
         shell: bash
-      - run: bun run scripts/appendix-a.ts | tee /dev/stderr | grep -qx IDENTICAL
-        shell: bash
+      # Exits 1 on a MISMATCH, naming the first line that differs.
+      - run: bun run scripts/appendix-a.ts

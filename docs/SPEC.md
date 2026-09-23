@@ -765,7 +765,7 @@ Four gaps. None of them is a feature, and each is a reason to distrust the plugi
 - `.github/workflows/check.yml`: on a push to any branch and on pull requests, matrix `ubuntu-latest`, `macos-latest`,
   `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `actions/setup-node`, `npm i -g
   @anthropic-ai/claude-code@2.1.280`, then `bash scripts/check.sh` (`shell: bash`, so Windows runs it under
-  Git Bash), then `scripts/appendix-a.ts`, which must print `IDENTICAL`. The pin is the release the suite
+  Git Bash), then `scripts/appendix-a.ts`, which exits 1 on a `MISMATCH`. The pin is the release the suite
   was verified on, bumped by hand. It is not the README's minimum (2.1.273): nobody has run the suite
   against that one with the ops this version adds, and a job for it waits until somebody has. No secret:
   `validate`, `tsc` and `claude plugin test` run offline. If the
