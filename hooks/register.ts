@@ -21,6 +21,8 @@ import { Band, Pane } from './ui'
 
 const FIX_USAGE = 'Usage: /saver fix [n] [instruction] (a leading number is the card the pane draws; without one: the card whose Fix… field is open, else card 1)'
 const SAVER_USAGE = 'Usage: /saver [check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]'
+// TODO(§12): English only until the i18n bundle (`hooks/say/`, PR #2) is on main. Then this line, the replies
+// of `forget`, the budget toast in `judgeAt` and `registryLines` in core/memory.ts move to `say/en.ts` (SPEC §13.5).
 const FORGET_USAGE = 'Usage: /saver forget <n|id|all> (n as /saver patterns numbers them)'
 const NOTHING_TEXT = 'ContextSaver: nothing to decide on'
 const CHECKING_TEXT = 'ContextSaver: checking this session for waste…'
@@ -175,7 +177,8 @@ export function register(on: On, options: PluginOptions = {}): void {
   }
 
   // `/saver forget <n|id|all>`: out of the session and out of the store, by a read-filter-write — never through
-  // `persist`, whose merge is a union and would write the pattern straight back.
+  // `persist`, whose merge is a union and would write the pattern straight back. TODO(§12): its replies move
+  // to `say/en.ts` once the bundle is on main (SPEC §13.5).
   const forget = async (engine: Host, token: string): Promise<string> => {
     if (token === '') return FORGET_USAGE
     const key = registryKey(state.projectKey)
@@ -370,6 +373,7 @@ export function register(on: On, options: PluginOptions = {}): void {
     }
     if (!budgetSpoke && budgetStopped(state)) {
       budgetSpoke = true
+      // TODO(§12): `say().band.auditPaused(share, stop)` once the bundle is on main (SPEC §13.5).
       host?.toast(`ContextSaver: the audit paused at ${pctText(state.judge.spent / totalTokens(state))} of this session's tokens (it stops past ${pctText(JUDGE_STOP_FACTOR * state.budget)}) — /saver check still runs`)
     }
   }

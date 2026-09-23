@@ -84,6 +84,8 @@ export const namedIn = (stored: readonly StoredPattern[], token: string): Stored
   return /^\d+$/.test(token) ? order[Number(token) - 1] : order.find(p => p.id === token)
 }
 
+// TODO(§12): the two headlines are English until the i18n bundle (`hooks/say/`, PR #2) is on main; then they
+// become `say().command.patternsEmpty` and `patternsHead`. The line itself stays: ids, dates and counts are typed back.
 /** What `/saver patterns` prints: one line per learned pattern, numbered as `/saver forget` takes them. */
 export const registryLines = (stored: readonly StoredPattern[], projectKey: string): string => {
   if (stored.length === 0) return `ContextSaver: nothing learned for ${projectKey} yet`

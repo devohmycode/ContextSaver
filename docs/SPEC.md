@@ -857,6 +857,23 @@ input than the fork it replaced. **Rejected**; the lever is the budget.
 A model choice for the audit (§13.4); syncing the memory between machines; localised dates in `/saver
 patterns`.
 
+**Follow-up once §12 is on main.** This section was built on `main`, which has no `hooks/say/`, so every line
+it adds is an English constant, each marked `TODO(§12)` in the code. When the i18n bundle lands, they move to
+`say/en.ts` as below, and the other languages may leave them to the English fallback:
+
+| Where it is now | Text | Key in `say/en.ts` |
+|---|---|---|
+| `register.ts`, `SAVER_USAGE` | `patterns \| forget <n\|id\|all>` added to the usage | `command.usage` (already there, extended) |
+| `types.ts`, `COMMAND` | the same two subcommands in `description` and `argumentHint` | `command.description`, `command.argumentHint` (already there, extended) |
+| `register.ts`, `FORGET_USAGE` | `Usage: /saver forget <n\|id\|all> …` | `command.forgetUsage` |
+| `register.ts`, `forget` | `forgot every pattern learned for …`, `no pattern … — /saver patterns lists them`, `forgot <id> — "<kind>"` | `command.forgotAll(key)`, `command.noPattern(token)`, `command.forgot(id, kind)` |
+| `register.ts`, `judgeAt` | `the audit paused at <share> … (it stops past <stop>) — /saver check still runs` | `band.auditPaused(share, stop)` |
+| `core/memory.ts`, `registryLines` | `nothing learned for … yet`, `<n> patterns learned for …` | `command.patternsEmpty(key)`, `command.patternsHead(n, key)` |
+
+What stays as it is: the subcommand words, the ids, the ISO dates, the counts and the `/saver debug` line,
+which are typed or read back (§12.1, §12.6). The `auditBudget` row's label and help go through
+`config.describe` like the language row's.
+
 ---
 
 ## Appendix A — The judge prompt (verbatim; `JUDGE_PROMPT` in `core/judge.ts`)
