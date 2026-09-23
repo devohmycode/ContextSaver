@@ -1,0 +1,27 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Pinned to the release the suite was last verified on; bumped by hand, never floating.
+      - run: npm install -g @anthropic-ai/claude-code@2.1.280
+      # validate, typecheck and the plugin's tests: none of them reaches the network or needs a key.
+      - run: bash scripts/check.sh
+        shell: bash
+      - run: bun run scripts/appendix-a.ts | tee /dev/stderr | grep -qx IDENTICAL
+        shell: bash

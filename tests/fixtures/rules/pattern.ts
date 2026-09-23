@@ -12,6 +12,7 @@ export const rulePattern = (over: Partial<Pattern>): Pattern => ({
   proposal: null,
   estTokensPerTurn: null,
   lastDecision: null,
+  seen: { sessions: 0, last: 0 },
   hits: ['t1', 't2'],
   decision: null,
   decidedAtTurn: null,

@@ -12,4 +12,5 @@ export const storedSuite: StoredPattern = {
   proposal: null,
   estTokensPerTurn: null,
   lastDecision: 'kill',
+  seen: { sessions: 1, last: 1_699_913_600_000 },
 }

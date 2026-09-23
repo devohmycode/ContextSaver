@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { JUDGE_PROMPT, buildPrompt, costOf, judgeAliases, merge, parseReply, shouldRun, spentOf, usageOf } from '../hooks/core/judge'
-import { debugDump } from '../hooks/core/patterns'
-import { ALTERNATIVE_MAX, JUDGE_MIN_GAP_MS, JUDGE_MIN_NEW_ROWS, KIND_MAX, MAX_PATTERNS } from '../hooks/core/types'
+import { debugDump, totalTokens } from '../hooks/core/patterns'
+import { ALTERNATIVE_MAX, JUDGE_BUDGET_SHARE, JUDGE_MIN_GAP_MS, JUDGE_MIN_NEW_ROWS, JUDGE_STOP_FACTOR, KIND_MAX, MAX_PATTERNS } from '../hooks/core/types'
 import type { Row } from '../hooks/core/types'
 import { judgeFinding } from './fixtures/judge/judgeFinding'
 import { judgePattern } from './fixtures/judge/judgePattern'
@@ -38,6 +38,15 @@ describe('judge', () => {
   test('shouldRun demands proportionally more new tokens after a backoff', ($, _on) => {
     expect(shouldRun(judgeState({ judge: { ...judgeState().judge, backoff: 1 } }), 0)).toBe(true)
     expect(shouldRun(judgeState({ judge: { ...judgeState().judge, backoff: 2 } }), 0)).toBe(false)
+  })
+
+  test('shouldRun stops the automatic audit past twice its budget, and never runs it at a budget of 0', ($, _on) => {
+    const total = totalTokens(judgeState())
+    const spending = (spent: number, budget = JUDGE_BUDGET_SHARE) => judgeState({ budget, judge: { ...judgeState().judge, spent } })
+    expect(shouldRun(spending(JUDGE_STOP_FACTOR * JUDGE_BUDGET_SHARE * total), 0), 'at the stop it still runs').toBe(true)
+    expect(shouldRun(spending(JUDGE_STOP_FACTOR * JUDGE_BUDGET_SHARE * total + 1), 0), 'past it, it waits').toBe(false)
+    expect(shouldRun(spending(JUDGE_STOP_FACTOR * JUDGE_BUDGET_SHARE * total + 1, 0.1), 0), 'a larger budget moves the stop').toBe(true)
+    expect(shouldRun(spending(0, 0), 0), 'a budget of 0 is /saver check only').toBe(false)
   })
 
   // One agentic turn can run for hours: `turn.complete` never fires, so the rows and the clock are the cadence.

@@ -2,7 +2,9 @@ import type { ModelForkResult, SessionMessage } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { AUTO_OPEN_MIN_COLUMNS, JUDGE_MIN_GAP_MS, JUDGE_MIN_NEW_ROWS, JUDGE_MIN_ROWS, RUN_FRESH_MS, RUN_REFRESH_MS, STEER_RING_TRIES, STEER_RING_WAIT_MS } from '../hooks/core/types'
+import { parseRegistry } from '../hooks/core/patterns'
+import { AUTO_OPEN_MIN_COLUMNS, JUDGE_MIN_GAP_MS, JUDGE_MIN_NEW_ROWS, JUDGE_MIN_ROWS, RUN_FRESH_MS, RUN_REFRESH_MS, STEER_RING_TRIES, STEER_RING_WAIT_MS, STORE_SOFT_CAP } from '../hooks/core/types'
+import type { StoredPattern } from '../hooks/core/types'
 import { assistant } from './fixtures/adopt/assistant'
 import { bashUse } from './fixtures/adopt/bashUse'
 import { prompt } from './fixtures/adopt/prompt'
@@ -53,6 +55,10 @@ const transcriptOf = (steps: number): SessionMessage[] =>
 // A long history: a whole row gate's worth of finished calls. A history worth judging: past the row floor.
 const LONG_TRANSCRIPT = transcriptOf(JUDGE_MIN_NEW_ROWS)
 const JOINED_CALLS = 12
+
+// A path as the test wrote it: the engine resolves one against the host's filesystem, so on Windows
+// `/work/CLAUDE.md` reaches a stub as `C:\work\CLAUDE.md`. The drive and the separators are the host's.
+const posix = (path: string): string => path.replace(/^[A-Za-z]:/, '').replaceAll('\\', '/')
 
 // Everything a plugin tree draws, flattened to the strings a person would read.
 const textOf = (value: unknown): string => {
@@ -414,7 +420,7 @@ describe('register', () => {
     expect((await $.command.run(saverRun('ignore 3'))).text, 'a number no card wears says so')
       .toBe('ContextSaver: no card 3 (1–2)')
     expect((await $.command.run(saverRun('ignore nonsense'))).text)
-      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | debug | reset]')
+      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]')
     expect((await $.command.run(saverRun('fix'))).text, 'a fix with neither a number nor a note is a usage question')
       .toContain('Usage: /saver fix [n] [instruction]')
 
@@ -493,7 +499,7 @@ describe('register', () => {
     expect(debug.text, 'the registry survived, its evidence did not').toContain(`${SUITE_ID} · hits 0`)
     expect(debug.text).toContain('previous keep')
     expect((await $.command.run(saverRun('nonsense'))).text)
-      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | debug | reset]')
+      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]')
     expect((await $.command.run(saverRun('reset'))).text).toBe('ContextSaver: session state reset')
   })
 
@@ -587,7 +593,7 @@ describe('register', () => {
     await $.turn.start({ text: 'rewrite the proxy', turnId: 't1' })
     await $.tool.call({ tool: 'Workflow', name: 'proxy-rewrite', script: 'export default async () => {}' })
     await world.clock.settle()
-    expect(reads, 'the launch reads the journal at once').toEqual(['/tmp/runs/w3/journal.jsonl'])
+    expect(reads.map(posix), 'the launch reads the journal at once').toEqual(['/tmp/runs/w3/journal.jsonl'])
 
     await $.turn.complete({ answer: 'implemented', durationMs: 300_000, isAborted: false, turnId: 's1', reason: 'answer', agentId: 'agent-1', usage: TURN_USAGE })
     await $.tool.call({ tool: 'Bash', command: 'bun test' })
@@ -1283,7 +1289,7 @@ describe('register', () => {
     await world.clock.settle()
 
     expect(writes, 'one append to the project file').toHaveLength(1)
-    expect(writes[0]?.path).toBe('/work/CLAUDE.md')
+    expect(posix(writes[0]?.path ?? '')).toBe('/work/CLAUDE.md')
     expect(writes[0]?.text, 'the heading was already there, so only the bullet was added')
       .toBe('# Project\n\n## ContextSaver\n- an older rule\n- run only the covering tests\n')
     expect(world.toasts.join(' ')).toContain('Wrote /work/CLAUDE.md')
@@ -1299,5 +1305,103 @@ describe('register', () => {
     expect(debug.text).toContain(`written 2: ${SUITE_ID}:claude-md, ${LOG_ID}:claude-md`)
     expect(debug.text, 'the tried rule is the sentence the note already sent, so it rides once').toContain('standing 2')
     expect(textOf(await $.ui.render(paneRender())), 'a rule once written or tried is not offered again').not.toContain('Write')
+  })
+
+  test('/saver patterns lists what the project learned, and /saver forget drops it for good', async ($, on) => {
+    const log: StoredPattern = { ...storedSuite, id: LOG_ID, kind: 'Claude keeps dumping the whole api log', lastDecision: null, seen: { sessions: 1, last: 0 } }
+    const world = startsSaver(on, { 'patterns:/work': [storedSuite, log] })
+
+    await $.session.start(SESSION)
+
+    const listed = await $.command.run(saverRun('patterns'))
+    expect(listed.text).toContain('ContextSaver: 2 patterns learned for /work')
+    expect(listed.text, 'the most recently seen first').toContain(`1 · ${SUITE_ID} · `)
+    expect(listed.text).toContain(`2 · ${LOG_ID} · Claude keeps dumping the whole api log · undecided · ×1 · -`)
+
+    expect((await $.command.run(saverRun('forget'))).text).toBe('Usage: /saver forget <n|id|all> (n as /saver patterns numbers them)')
+    expect((await $.command.run(saverRun('forget 7'))).text).toBe('ContextSaver: no pattern 7 — /saver patterns lists them')
+    expect((await $.command.run(saverRun('forget 2'))).text).toBe(`ContextSaver: forgot ${LOG_ID} — "Claude keeps dumping the whole api log"`)
+    expect(parseRegistry(world.store['patterns:/work']).map(p => p.id)).toEqual([SUITE_ID])
+    expect((await $.command.run(saverRun('debug'))).text, 'and out of the session too').not.toContain(LOG_ID)
+
+    // A later persist merges the session into the store: a forgotten pattern is not in the session to merge.
+    await $.command.run(saverRun(`forget ${SUITE_ID}`))
+    expect((await $.command.run(saverRun('patterns'))).text).toBe('ContextSaver: nothing learned for /work yet')
+
+    world.store['patterns:/work'] = [storedSuite]
+    expect((await $.command.run(saverRun('forget all'))).text).toBe('ContextSaver: forgot every pattern learned for /work')
+    expect('patterns:/work' in world.store).toBe(false)
+  })
+
+  test('the registry is the repository\'s, shared by its worktrees, and a folder\'s registry moves under it once', async ($, on) => {
+    const world = startsSaver(on, { 'patterns:/work': [storedSuite] })
+    const asked: { argv: readonly string[]; cwd: string | undefined }[] = []
+    on('process.run', ($, e) => {
+      asked.push({ argv: e.argv, cwd: e.init?.cwd })
+      return { value: { exitCode: 0, stdout: '/repo/.git\n', stderr: '' } }
+    })
+
+    await $.session.start(SESSION)
+
+    expect(asked).toEqual([{ argv: ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd: '/work' }])
+    expect(parseRegistry(world.store['patterns:/repo']).map(p => p.id), 'the folder\'s registry was folded in').toEqual([SUITE_ID])
+    expect((await $.command.run(saverRun('patterns'))).text).toContain('1 pattern learned for /repo')
+    expect((await $.command.run(saverRun('debug'))).text, 'and it is loaded').toContain(`${SUITE_ID} · hits 0`)
+  })
+
+  test('a folder git does not answer for keeps its registry under the folder', async ($, on) => {
+    startsSaver(on, { 'patterns:/work': [storedSuite] })
+    on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository' } }))
+
+    await $.session.start(SESSION)
+
+    expect((await $.command.run(saverRun('patterns'))).text).toContain('1 pattern learned for /work')
+  })
+
+  test('a full store gives up the least recently used registries and dates the session\'s own', async ($, on) => {
+    const world = startsSaver(on, {
+      'patterns:/old': [{ filler: 'x'.repeat(STORE_SOFT_CAP) }],
+      'patterns:/recent': [storedSuite],
+      'patterns:/work': [storedSuite],
+      projects: { 'patterns:/old': 1, 'patterns:/recent': 2, 'patterns:/gone': 3 },
+    })
+
+    await $.session.start(SESSION)
+    await world.clock.settle()
+
+    expect(Object.keys(world.store).sort()).toEqual(['patterns:/recent', 'patterns:/work', 'projects'])
+    expect(world.store['projects'], 'a key the store no longer holds leaves the index')
+      .toEqual({ 'patterns:/recent': 2, 'patterns:/work': 1_700_000_000_000 })
+  })
+
+  test('past its budget the automatic audit stops and says so once, and /saver check still runs', async ($, on) => {
+    const world = startsSaver(on)
+    let forks = 0
+    on('tool.call', () => bashAnswer(OUT_CHARS))
+    on('model.fork', () => {
+      forks += 1
+      return { value: { ...forkAnswer(replyText([])), usage: { input_tokens: 10_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+    })
+
+    await $.session.start(SESSION)
+    await runTurns($, 3, 3)
+    await world.clock.settle()
+    expect(forks, 'the cadence ran the audit once').toBe(1)
+
+    await runTurns($, 3, 3)
+    await world.clock.settle()
+    expect(forks, 'ten thousand tokens over a hundred and thirty-two thousand is past twice three percent').toBe(1)
+    expect(world.toasts.filter(t => t.startsWith('ContextSaver: the audit paused at')), 'said once, however many lanes find it stopped')
+      .toEqual(['ContextSaver: the audit paused at 22.7% of this session\'s tokens (it stops past 6%) — /saver check still runs'])
+    expect((await $.command.run(saverRun('debug'))).text).toContain('budget 3% · stops at 6% · paused (budget)')
+
+    await $.command.run(saverRun('check'))
+    await world.clock.settle()
+    expect(forks, 'the person asked').toBe(2)
+
+    // The stop is a share, not a sum: a session that keeps growing brings the audit back under it.
+    await runTurns($, 12, 3)
+    await world.clock.settle()
+    expect(forks, 'the session outgrew what the audit spent').toBe(3)
   })
 })

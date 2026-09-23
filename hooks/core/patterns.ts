@@ -3,7 +3,7 @@ import { activeRuns, countRow } from './spawns'
 import { collapseWs, duration, instructionOf, killPrompt, median, pctOf } from './text'
 import {
   ALTERNATIVE_MAX, CARD_EVIDENCE, DEBUG_MAX_DROPPED, DEBUG_MAX_LINES, DEBUG_MAX_PATTERNS, FILE_TOOLS,
-  JUDGE_BUDGET_SHARE, JUDGE_MAX_BACKOFF, KEY_MAX, KIND_MAX, LOOP_CAP, MAIN_AGENT, MAX_PATTERNS, NO_CALLS, ROW_CAP,
+  JUDGE_MAX_BACKOFF, JUDGE_STOP_FACTOR, KEY_MAX, KIND_MAX, LOOP_CAP, MAIN_AGENT, MAX_PATTERNS, NO_CALLS, ROW_CAP,
   SETTLE_TURNS, TREND_TURNS, initialState,
 } from './types'
 import type {
@@ -296,7 +296,7 @@ const applyJudgeDone = (state: State, a: Extract<Action, { type: 'judge.done' }>
       runs: state.judge.runs + 1,
       spent,
       // No completed turn is no budget to be over: the first run of a reloaded session doubles nothing.
-      backoff: total > 0 && spent > JUDGE_BUDGET_SHARE * total ? Math.min(state.judge.backoff * 2, JUDGE_MAX_BACKOFF) : state.judge.backoff,
+      backoff: total > 0 && spent > state.budget * total ? Math.min(state.judge.backoff * 2, JUDGE_MAX_BACKOFF) : state.judge.backoff,
       error: a.error,
       focus: a.focus,
       time: a.time,
@@ -310,11 +310,41 @@ const applyJudgeDone = (state: State, a: Extract<Action, { type: 'judge.done' }>
 
 const applyReset = (state: State): State => ({
   ...initialState(state.cwd, state.usage.window),
+  projectKey: state.projectKey,
+  budget: state.budget,
   overhead: state.overhead,
   columns: state.columns,
   paneOpen: state.paneOpen,
   patterns: state.patterns.map(p => fromStored(toStored(p))),
 })
+
+// A pattern this session had to do with: the judge found it, a row matched it, or the person decided it.
+const isLive = (p: Pattern): boolean => p.hits.length > 0 || p.decision !== null
+
+// One more session for every live pattern not yet counted in this one; a reload of the same session counts once.
+const applySeen = (state: State, now: number): State => {
+  const due = state.patterns.filter(p => isLive(p) && !state.counted.includes(p.id)).map(p => p.id)
+  if (due.length === 0) return state
+  return {
+    ...state,
+    patterns: state.patterns.map(p => (due.includes(p.id) ? { ...p, seen: { sessions: p.seen.sessions + 1, last: now } } : p)),
+    counted: [...state.counted, ...due],
+  }
+}
+
+// Forgetting wipes the memory, not what this session already sent: a standing instruction stays standing.
+const applyForget = (state: State, patternId: string | null): State => {
+  const gone = (id: string | null): boolean => id !== null && (patternId === null || id === patternId)
+  return {
+    ...state,
+    patterns: state.patterns.filter(p => !gone(p.id)),
+    cards: state.cards.filter(id => !gone(id)),
+    counted: state.counted.filter(id => !gone(id)),
+    expanded: gone(state.expanded) ? null : state.expanded,
+    steering: gone(state.steering) ? null : state.steering,
+    steerDraft: gone(state.steering) ? null : state.steerDraft,
+  }
+}
 
 /** Applies one action to the state, returning a new state (never mutates its input). */
 export const reduce = (state: State, action: Action): State => {
@@ -372,6 +402,10 @@ export const reduce = (state: State, action: Action): State => {
       return { ...state, paneOpen: action.open, autoOpened: action.auto === true ? true : state.autoOpened }
     case 'columns':
       return { ...state, columns: action.columns }
+    case 'seen':
+      return applySeen(state, action.now)
+    case 'forget':
+      return applyForget(state, action.patternId)
     case 'reset':
       return applyReset(state)
   }
@@ -628,6 +662,16 @@ const proposalOf = (v: unknown): Proposal | null | undefined => {
   return isFilled(title) && isFilled(body) ? { kind, title, body } : undefined
 }
 
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0
+
+// An entry written before v0.6 has no count: it was found once, at a time nobody recorded.
+const seenOf = (v: unknown): StoredPattern['seen'] => {
+  const o = fields(v)
+  const sessions = o?.['sessions']
+  const last = o?.['last']
+  return isCount(sessions) && isCount(last) ? { sessions, last } : { sessions: 1, last: 0 }
+}
+
 const storedOf = (v: unknown): StoredPattern | null => {
   const o = fields(v)
   if (o === null) return null
@@ -648,7 +692,7 @@ const storedOf = (v: unknown): StoredPattern | null => {
   if (estTokensPerTurn !== null && !(typeof estTokensPerTurn === 'number' && Number.isFinite(estTokensPerTurn) && estTokensPerTurn >= 0)) return null
   if (lastDecision !== null && !isOneOf(lastDecision, ['keep', 'steer', 'kill'])) return null
   if (signature === undefined || proposal === undefined) return null
-  return { id, category, kind, signature, why, alternative, confidence, proposal, estTokensPerTurn, lastDecision }
+  return { id, category, kind, signature, why, alternative, confidence, proposal, estTokensPerTurn, lastDecision, seen: seenOf(o['seen']) }
 }
 
 /** Reads a stored registry from the plugin store, dropping every entry that does not validate. */
@@ -674,6 +718,7 @@ export const toStored = (p: Pattern): StoredPattern => ({
   proposal: p.proposal,
   estTokensPerTurn: p.estTokensPerTurn,
   lastDecision: p.lastDecision,
+  seen: { ...p.seen },
 })
 
 /** Revives a stored pattern with empty session fields. */
@@ -742,6 +787,21 @@ const loadCheckLine = (state: State, spoke: boolean): string => {
 const sinkLine = (label: string, unit: string, budget: Sinks | null): string =>
   `${label} sinks: ${budget === null ? '-' : [`${budget.total}${unit} total`, ...budget.sinks.map(s => `${s.label} ${s.amount} ×${s.count}`)].join(' · ')}`
 
+/** True when the audit has spent past its stop (JUDGE_STOP_FACTOR times its share): the automatic lanes wait, `/saver check` does not. */
+export const budgetStopped = (state: State): boolean => {
+  const total = totalTokens(state)
+  return state.budget > 0 && total > 0 && state.judge.spent > JUDGE_STOP_FACTOR * state.budget * total
+}
+
+// A share as the percentage a person reads, to one decimal.
+const shareText = (share: number): string => `${Math.round(share * 1000) / 10}%`
+
+// The audit's share, the point it stops at, and whether it has: the figures `auditBudget` sets.
+const budgetLabel = (state: State): string =>
+  state.budget === 0
+    ? 'on request only'
+    : `${shareText(state.budget)} · stops at ${shareText(JUDGE_STOP_FACTOR * state.budget)}${budgetStopped(state) ? ' · paused (budget)' : ''}`
+
 /** Renders the whole state, and whether the load lane has reported yet, for `/saver debug` in ≤ 40 lines. */
 export const debugDump = (state: State, spoke = false): string => {
   const j = state.judge
@@ -757,7 +817,7 @@ export const debugDump = (state: State, spoke = false): string => {
     ...patternLines(state),
     `cards ${state.cards.length}${state.cards.length === 0 ? '' : `: ${state.cards.join(', ')}`}`,
     `notes ${state.notes.length} · standing ${state.standing.length} · written ${state.written.length}${state.written.length === 0 ? '' : `: ${state.written.join(', ')}`}`,
-    `judge runs ${j.runs} · spent ${j.spent} tokens (${share === null ? '-' : `${share}%`} of the session) · backoff ${j.backoff} · running ${j.running} · lastAt ${j.lastAtTokens} tokens / turn ${j.lastAtTurn} / row ${j.lastAtSeq} / ${j.lastAtMs}ms · error ${j.error ?? '-'} · focus ${oneLine(j.focus)}`,
+    `judge runs ${j.runs} · spent ${j.spent} tokens (${share === null ? '-' : `${share}%`} of the session) · budget ${budgetLabel(state)} · backoff ${j.backoff} · running ${j.running} · lastAt ${j.lastAtTokens} tokens / turn ${j.lastAtTurn} / row ${j.lastAtSeq} / ${j.lastAtMs}ms · error ${j.error ?? '-'} · focus ${oneLine(j.focus)}`,
     `judge time: ${oneLine(j.time)}`,
     `judge context: ${oneLine(j.context)}`,
     ...judgeRunLines(j.last),

@@ -588,10 +588,44 @@ describe('patterns', () => {
     expect(parseRegistry([toStored(suitePattern), toStored(chattyPattern)])).toEqual([toStored(suitePattern), toStored(chattyPattern)])
   })
 
+  test('an entry written before v0.6 reads as seen once, at a time nobody recorded', async () => {
+    const { seen: _dropped, ...old } = toStored(suitePattern)
+    expect(parseRegistry([old])[0]?.seen).toEqual({ sessions: 1, last: 0 })
+    expect(parseRegistry([{ ...old, seen: { sessions: -1, last: 5 } }])[0]?.seen, 'a count that is no count is read as the default').toEqual({ sessions: 1, last: 0 })
+    expect(parseRegistry([{ ...old, seen: { sessions: 4, last: 9 } }])[0]?.seen).toEqual({ sessions: 4, last: 9 })
+  })
+
+  test('seen counts a session once for every pattern it found, matched or decided, and none it merely loaded', async () => {
+    const loaded = fromStored({ ...toStored(chattyPattern), seen: { sessions: 2, last: 10 } })
+    const matched = { ...suitePattern, hits: ['r-1'], seen: { sessions: 2, last: 10 } }
+    const state = seedState({ patterns: [matched, loaded] })
+    const once = reduce(state, { type: 'seen', now: 50 })
+    expect(once.patterns.map(p => p.seen)).toEqual([{ sessions: 3, last: 50 }, { sessions: 2, last: 10 }])
+    const twice = reduce(once, { type: 'seen', now: 80 })
+    expect(twice.patterns[0]?.seen, 'a second persist in the same session counts nothing').toEqual({ sessions: 3, last: 50 })
+    const decided = reduce(twice, { type: 'decide', patternId: loaded.id, choice: 'keep' })
+    expect(reduce(decided, { type: 'seen', now: 90 }).patterns[1]?.seen, 'a decision is having to do with it').toEqual({ sessions: 3, last: 90 })
+  })
+
+  test('forget drops one pattern or all of them from the session, and a reset keeps the project and the budget', async () => {
+    const state = seedState({
+      projectKey: '/repo', budget: 0.05, patterns: [suitePattern, chattyPattern], cards: [suitePattern.id, chattyPattern.id],
+      expanded: suitePattern.id, steering: suitePattern.id, steerDraft: 'x', counted: [suitePattern.id],
+    })
+    const one = reduce(state, { type: 'forget', patternId: suitePattern.id })
+    expect(one.patterns.map(p => p.id)).toEqual([chattyPattern.id])
+    expect(one.cards).toEqual([chattyPattern.id])
+    expect([one.expanded, one.steering, one.steerDraft, one.counted]).toEqual([null, null, null, []])
+    const all = reduce(state, { type: 'forget', patternId: null })
+    expect([all.patterns, all.cards]).toEqual([[], []])
+    const reset = reduce(state, { type: 'reset' })
+    expect([reset.projectKey, reset.budget, reset.counted]).toEqual(['/repo', 0.05, []])
+  })
+
   test('toStored drops the session fields, fromStored revives them, mergeStored lets b win', async () => {
     const live: Pattern = { ...suitePattern, hits: ['r-1'], decision: 'kill', decidedAtTurn: 5, lastDecision: 'kill', instruction: 'x', openedAtTurn: 5, ignored: 1 }
     const stored = toStored(live)
-    expect(Object.keys(stored).sort()).toEqual(['alternative', 'category', 'confidence', 'estTokensPerTurn', 'id', 'kind', 'lastDecision', 'proposal', 'signature', 'why'])
+    expect(Object.keys(stored).sort()).toEqual(['alternative', 'category', 'confidence', 'estTokensPerTurn', 'id', 'kind', 'lastDecision', 'proposal', 'seen', 'signature', 'why'])
     expect(fromStored(stored)).toEqual({ ...stored, hits: [], decision: null, decidedAtTurn: null, instruction: null, openedAtTurn: null, ignored: 0 })
     const merged = mergeStored(
       [toStored(suitePattern), toStored(chattyPattern)],

@@ -1,24 +1,27 @@
-import type { ModelForkResult, On, PaneOpenArgs, RenderElement } from 'claude-code'
+import type { ModelForkResult, On, PaneOpenArgs, PluginOptions, RenderElement } from 'claude-code'
 
 import { adoptRows } from './core/adopt'
 import { demoForkUsage, demoPatterns, demoRows, demoTurns, demoUsage } from './core/demo'
 import { buildPrompt, judgeAliases, merge, parseReply, shouldRun, spentOf, usageOf } from './core/judge'
 import { rowOf } from './core/ledger'
+import { evictions, namedIn, parseProjects, projectKeyOf, registryKey, registryLines } from './core/memory'
 import type { ToolEvent } from './core/ledger'
-import { bandModel, debugDump, fromStored, mergeStored, paneModel, parseRegistry, reduce, toStored, usageLine } from './core/patterns'
+import { bandModel, budgetStopped, debugDump, fromStored, mergeStored, paneModel, parseRegistry, reduce, toStored, totalTokens, usageLine } from './core/patterns'
 import { appendedTo, bulletOnly, mergeSettings, propose } from './core/rules'
 import { activeRuns, agentOf, journalPath, parseJournal, runOf } from './core/spawns'
 import { collapseWs, duration, fit, instructionOf, pctOf } from './core/text'
 import {
-  AUTO_OPEN_MIN_COLUMNS, CLAUDE_MD_HEADING, COMMAND, DEBUG_MAX_DROPPED, JUDGE_MIN_ROWS, MAX_PATTERNS, PANE_ID,
-  PANE_INLINE_ROWS, PANE_TITLE, PLUGIN_NAME, RUN_REFRESH_MS, STEER_RING_TRIES, STEER_RING_WAIT_MS, initialState,
+  AUTO_OPEN_MIN_COLUMNS, CLAUDE_MD_HEADING, COMMAND, DEBUG_MAX_DROPPED, GIT_TIMEOUT_MS, JUDGE_BUDGET_MAX, JUDGE_BUDGET_SHARE,
+  JUDGE_MIN_ROWS, JUDGE_STOP_FACTOR, MAX_PATTERNS, PANE_ID, PANE_INLINE_ROWS, PANE_TITLE, PATTERNS_KEY, PLUGIN_NAME, PROJECTS_KEY,
+  RUN_REFRESH_MS, STEER_RING_TRIES, STEER_RING_WAIT_MS, STORE_SOFT_CAP, initialState,
 } from './core/types'
-import type { Action, Actions, Artifact, Choice, Run, State, Tokens, Ui } from './core/types'
+import type { Action, Actions, Artifact, Choice, Run, State, StoredPattern, Tokens, Ui } from './core/types'
 import type { Host } from './host'
 import { Band, Pane } from './ui'
 
 const FIX_USAGE = 'Usage: /saver fix [n] [instruction] (a leading number is the card the pane draws; without one: the card whose Fix… field is open, else card 1)'
-const SAVER_USAGE = 'Usage: /saver [check | fix [n] [text] | ignore <n> | debug | reset]'
+const SAVER_USAGE = 'Usage: /saver [check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]'
+const FORGET_USAGE = 'Usage: /saver forget <n|id|all> (n as /saver patterns numbers them)'
 const NOTHING_TEXT = 'ContextSaver: nothing to decide on'
 const CHECKING_TEXT = 'ContextSaver: checking this session for waste…'
 const ALREADY_TEXT = 'ContextSaver: already checking'
@@ -30,6 +33,16 @@ const DEMO_CONTEXT = [120_000, 190_000, 250_000, 320_000]   // `/saver demo`: th
 // person, or a check armed at load over a transcript this plugin joined late.
 type JudgeReason = 'tool.call' | 'turn.complete' | '/saver check' | 'load'
 
+/** The audit's share of the session's tokens from `/config`'s `auditBudget`, a percentage; the default for anything that is not one. */
+const budgetOf = (options: PluginOptions): number => {
+  const raw = options['auditBudget']
+  const value = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.min(value / 100, JUDGE_BUDGET_MAX) : JUDGE_BUDGET_SHARE
+}
+
+// A share of the session's tokens as a person reads it.
+const pctText = (share: number): string => `${Math.round(share * 1000) / 10}%`
+
 // The lanes the run answers out loud: the check the person typed, and the one the load armed for them.
 const REQUESTED: readonly JudgeReason[] = ['/saver check', 'load']
 
@@ -38,8 +51,10 @@ const REQUESTED: readonly JudgeReason[] = ['/saver check', 'load']
  * behaviours, the band and the pane that let the user fix or ignore them.
  *
  * @param on the engine's registrar
+ * @param options what `/config` holds for this plugin; only `auditBudget` is read, once, here
  */
-export function register(on: On): void {
+export function register(on: On, options: PluginOptions = {}): void {
+  const budget = budgetOf(options)
   let state: State = initialState('', 0)
   let host: Host | null = null
   let isDebug = false
@@ -52,6 +67,8 @@ export function register(on: On): void {
   // The load lane's one failure toast. Its arming survives every failure, so a toast per retry would be a
   // storm — but total silence reads exactly like a check that never fired, so the first failure speaks.
   let armedSpoke = false
+  // The budget's stop is said once a session: every lane after it stays quiet, and `/saver debug` still says it.
+  let budgetSpoke = false
 
   const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
@@ -87,6 +104,7 @@ export function register(on: On): void {
   const resetSession = (): void => {
     dispatch({ type: 'reset' })
     armedSpoke = false
+    budgetSpoke = false
   }
 
   // Inside a render hook: fold the action in with no redraw, since a redraw loops.
@@ -94,15 +112,85 @@ export function register(on: On): void {
     state = reduce(state, action)
   }
 
-  const persist = (): void => {
+  // Counts this session for every pattern it had to do with, then merges the registry into the store.
+  const persistNow = async (): Promise<void> => {
     const engine = host
     if (engine === null) return
-    const key = `patterns:${state.cwd}`
+    dispatch({ type: 'seen', now: await engine.now() })
+    const key = registryKey(state.projectKey)
     const mine = state.patterns.map(toStored)
-    void engine
-      .storeGet(key)
-      .then(value => engine.storeSet(key, mergeStored(parseRegistry(value), mine)))
-      .catch(() => undefined)
+    await engine.storeSet(key, mergeStored(parseRegistry(await engine.storeGet(key)), mine))
+  }
+
+  const persist = (): void => {
+    void persistNow().catch(() => undefined)
+  }
+
+  // The project the registry belongs to: the repository every worktree of it shares, else the folder (§13.3).
+  const projectKeyFor = async (engine: Host, cwd: string): Promise<string> => {
+    try {
+      const answer = await engine.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, timeoutMs: GIT_TIMEOUT_MS })
+      return (answer.exitCode === 0 ? projectKeyOf(answer.stdout) : null) ?? cwd
+    } catch {
+      return cwd
+    }
+  }
+
+  // The project's registry; one kept under the folder before v0.6 is folded into the project's key once.
+  const loadRegistry = async (engine: Host, projectKey: string, cwd: string): Promise<StoredPattern[]> => {
+    const key = registryKey(projectKey)
+    const own = parseRegistry(await engine.storeGet(key))
+    const legacyKey = registryKey(cwd)
+    if (own.length > 0 || legacyKey === key) return own
+    const legacy = parseRegistry(await engine.storeGet(legacyKey))
+    if (legacy.length === 0) return own
+    const merged = mergeStored(own, legacy)
+    await engine.storeSet(key, merged)
+    return merged
+  }
+
+  // Dates this project in the index, then gives up the least recently used registries until the store's fit
+  // under STORE_SOFT_CAP. Detached from the load: a store we cannot tidy costs the session nothing.
+  const tidyStore = async (engine: Host, projectKey: string): Promise<void> => {
+    const now = await engine.now()
+    const current = registryKey(projectKey)
+    const keys = (await engine.storeKeys()).filter(key => key.startsWith(PATTERNS_KEY))
+    const sizes: Record<string, number> = {}
+    for (const key of keys) sizes[key] = JSON.stringify((await engine.storeGet(key)) ?? null).length
+    const known = parseProjects(await engine.storeGet(PROJECTS_KEY))
+    const projects: Record<string, number> = { ...Object.fromEntries(Object.entries(known).filter(([key]) => keys.includes(key))), [current]: now }
+    const gone = evictions(sizes, projects, current, STORE_SOFT_CAP)
+    for (const key of gone) {
+      await engine.storeDelete(key)
+      delete projects[key]
+    }
+    await engine.storeSet(PROJECTS_KEY, projects)
+    if (isDebug && gone.length > 0) engine.log(`ContextSaver evicted ${gone.length} registr${gone.length === 1 ? 'y' : 'ies'} to fit the store: ${gone.join(', ')}`)
+  }
+
+  // `/saver patterns`: what the store holds for this project once this session's own share is in it.
+  const listPatterns = async (engine: Host): Promise<string> => {
+    await persistNow()
+    return registryLines(parseRegistry(await engine.storeGet(registryKey(state.projectKey))), state.projectKey)
+  }
+
+  // `/saver forget <n|id|all>`: out of the session and out of the store, by a read-filter-write — never through
+  // `persist`, whose merge is a union and would write the pattern straight back.
+  const forget = async (engine: Host, token: string): Promise<string> => {
+    if (token === '') return FORGET_USAGE
+    const key = registryKey(state.projectKey)
+    if (token === 'all') {
+      dispatch({ type: 'forget', patternId: null })
+      await engine.storeDelete(key)
+      return `ContextSaver: forgot every pattern learned for ${state.projectKey}`
+    }
+    await persistNow()
+    const stored = parseRegistry(await engine.storeGet(key))
+    const target = namedIn(stored, token)
+    if (target === undefined) return `ContextSaver: no pattern ${token} — /saver patterns lists them`
+    dispatch({ type: 'forget', patternId: target.id })
+    await engine.storeSet(key, stored.filter(p => p.id !== target.id))
+    return `ContextSaver: forgot ${target.id} — "${fit(target.kind, CARD_KIND)}"`
   }
 
   // An open the person asked for asks for their keyboard too, so the pane they just called up is the pane
@@ -275,7 +363,15 @@ export function register(on: On): void {
 
   // The opportunities a run can start at: the armed check first, else the cadence's own count of new work.
   const judgeAt = (now: number, cadence: JudgeReason): void => {
-    if (!armedCheck() && shouldRun(state, now)) void runJudge(cadence).catch(() => undefined)
+    if (armedCheck()) return
+    if (shouldRun(state, now)) {
+      void runJudge(cadence).catch(() => undefined)
+      return
+    }
+    if (!budgetSpoke && budgetStopped(state)) {
+      budgetSpoke = true
+      host?.toast(`ContextSaver: the audit paused at ${pctText(state.judge.spent / totalTokens(state))} of this session's tokens (it stops past ${pctText(JUDGE_STOP_FACTOR * state.budget)}) — /saver check still runs`)
+    }
   }
 
   const checkNow = (): string => {
@@ -451,6 +547,9 @@ export function register(on: On): void {
         messages: () => $.session.messages(),
         storeGet: key => $.store.get(key),
         storeSet: (key, value) => $.store.set(key, value),
+        storeDelete: key => $.store.delete(key),
+        storeKeys: () => $.store.keys(),
+        run: (argv, init) => $.process.run(argv, init),
         fork: prompt => $.model.fork({ prompt }),
         readFile: path => $.fs.read(path),
         writeFile: (path, text) => $.fs.write(path, text),
@@ -460,8 +559,9 @@ export function register(on: On): void {
       host = engine
       const u = await engine.usage({ breakdown: 'summary' })
       const now = await engine.now()
-      const stored = parseRegistry(await engine.storeGet(`patterns:${e.cwd}`))
-      state = { ...initialState(e.cwd, u.context.window), patterns: stored.map(fromStored) }
+      const projectKey = await projectKeyFor(engine, e.cwd)
+      const stored = await loadRegistry(engine, projectKey, e.cwd).catch(() => [])
+      state = { ...initialState(e.cwd, u.context.window), projectKey, budget, patterns: stored.map(fromStored) }
       dispatch({
         type: 'usage',
         usage: { window: u.context.window, compactAt: u.context.breakdown?.autoCompactThreshold, tokens: u.context.tokens, percent: u.context.percent },
@@ -484,6 +584,7 @@ export function register(on: On): void {
       } catch {
         isDebug = false
       }
+      void tidyStore(engine, projectKey).catch(() => undefined)
       // Last, so a transcript we cannot read costs the session nothing it already has.
       const adopted = adoptRows(await engine.messages())
       if (adopted.length === 0) return next(e)
@@ -717,6 +818,8 @@ export function register(on: On): void {
         await openPane()
         return { text: 'ContextSaver: demo wasters loaded' }
       }
+      if (sub === 'patterns') return { text: await listPatterns(host) }
+      if (sub === 'forget') return { text: await forget(host, args.slice(sub.length).trim()) }
       if (sub === 'debug') return { text: debugDump(state, armedSpoke) }
       if (sub === 'reset') {
         resetSession()

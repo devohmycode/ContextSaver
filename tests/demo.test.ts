@@ -126,6 +126,6 @@ describe('demo', () => {
     await $.session.start(SESSION)
 
     expect((await $.command.run(saverRun('demo'))).text)
-      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | debug | reset]')
+      .toBe('Usage: /saver [check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]')
   })
 })

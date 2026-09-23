@@ -3,5 +3,14 @@
   "version": "0.4.0",
   "description": "Watches a session for wasted context and time, shows a one-click card when a waste behaviour repeats, and lets the user steer or stop it.",
   "author": { "name": "Almog Baku" },
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "auditBudget": {
+      "type": "number",
+      "title": "Audit budget (% of session tokens)",
+      "description": "How much of the session's tokens the automatic audit may spend, in percent. Past it the audit runs less often; past twice it the automatic audit stops until the session has grown enough to bring it back under, and says so once. /saver check always runs. 0 means the audit runs only when you type /saver check. At most 50.",
+      "required": false,
+      "default": 3
+    }
+  }
 }

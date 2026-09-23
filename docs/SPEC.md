@@ -106,13 +106,15 @@ export const PANE_INLINE_ROWS = 18            // body rows requested when seated
 export const AUTO_OPEN_MIN_COLUMNS = 144      // unasked opens wait undrawn below this width (d.ts 1943-1945)
 export const STEER_RING_TRIES = 8             // frames the Fix… field's ring is asked for before the composer route is said
 export const STEER_RING_WAIT_MS = 40          // a frame and a little: the shown pane redraws at most thirty times a second
-export const COMMAND = { name: 'saver', description: 'ContextSaver: toggle the pane · check | fix [n] [text] | ignore <n> | debug | reset', argumentHint: '[check | fix [n] [text] | ignore <n> | debug | reset]' } as const
+export const COMMAND = { name: 'saver', description: 'ContextSaver: toggle the pane · check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset', argumentHint: '[check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]' } as const
 export const SETTLE_TURNS = 2                 // an instruction not ignored for this many turns is credited
 export const JUDGE_MIN_NEW_TOKENS = 30_000
 export const JUDGE_MIN_TURNS = 3
 export const JUDGE_MIN_ROWS = 8
 export const JUDGE_MAX_BACKOFF = 4
-export const JUDGE_BUDGET_SHARE = 0.03
+export const JUDGE_BUDGET_SHARE = 0.03          // the audit's default share of the session's tokens; `auditBudget` in /config overrides it
+export const JUDGE_BUDGET_MAX = 0.5            // the highest share `auditBudget` may set
+export const JUDGE_STOP_FACTOR = 2             // past this many times its share, the automatic audit stops; `/saver check` still runs
 export const JUDGE_LEDGER_ROWS = 150          // full rows rendered; older rows are folded into `~` summary lines
 export const MAX_FINDINGS = 6
 export const MAX_BEHAVIORAL_FINDINGS = 3      // findings with signature: null per judge run (agent findings are signature-null too)
@@ -139,6 +141,11 @@ export const LOOP_CAP = 400                   // loops kept (oldest dropped)
 export const AGENTS_ROWS = 60                 // loop lines the AGENTS block renders in full; older ones fold per run
 export const RUN_REFRESH_MS = 10_000          // a running workflow's journal is re-read at most this often
 export const RUN_FRESH_MS = 600_000           // a run with no loop yet counts as active this long after its launch
+export const PATTERNS_KEY = 'patterns:'       // store key prefix of one project's registry
+export const PROJECTS_KEY = 'projects'        // store key: each registry key's last session, for eviction
+export const STORE_SOFT_CAP = 3 * 1024 * 1024 // summed JSON length of every registry past which the least recently used are evicted (the store holds 4 MiB)
+export const GIT_TIMEOUT_MS = 2_000           // the project key's `git rev-parse`; past it the key is the folder
+export const LIST_KIND = 60                   // characters of a behaviour `/saver patterns` prints
 
 export type CommandClass = 'test' | 'lint' | 'format' | 'typecheck' | 'build' | 'install' | 'git' | 'read' | 'search' | 'other'
 export type Category = 'execution' | 'reading' | 'production' | 'behavior' | 'communication' | 'multi-agent' | 'environment' | 'process' | 'other'
@@ -181,6 +188,7 @@ export type StoredPattern = {
   proposal: Proposal | null
   estTokensPerTurn: number | null  // judge's estimate for behavioural patterns; null when a signature exists
   lastDecision: Choice | null      // the most recent session's decision, for the judge's calibration
+  seen: { sessions: number; last: number }   // sessions that found, matched or decided it, and the clock of the last one (0 unknown)
 }
 /** Session-only fields. */
 export type Pattern = StoredPattern & {
@@ -223,6 +231,9 @@ export type Usage = { tokens?: number; window: number; percent?: number; compact
 
 export type State = {
   cwd: string
+  projectKey: string               // the registry's store key without its prefix: the repository's root for every worktree of it, else the folder
+  budget: number                   // the audit's share of the session's tokens: past it the cadence slows, past JUDGE_STOP_FACTOR times it the automatic audit stops; 0 = only on /saver check
+  counted: string[]                // pattern ids whose `seen.sessions` this session already bumped
   turn: number
   seq: number                      // last Row.seq issued
   rows: Row[]                      // capped at ROW_CAP (oldest dropped)
@@ -250,7 +261,7 @@ export type State = {
 }
 
 export const initialState = (cwd: string, window: number): State => ({
-  cwd, turn: 0, seq: 0, rows: [], folded: {}, turns: [], loops: [], runs: [], usage: { window }, overhead: null, compactions: [], patterns: [], cards: [], expanded: null, steering: null, steerDraft: null, notes: [], standing: [], written: [],
+  cwd, projectKey: cwd, budget: JUDGE_BUDGET_SHARE, counted: [], turn: 0, seq: 0, rows: [], folded: {}, turns: [], loops: [], runs: [], usage: { window }, overhead: null, compactions: [], patterns: [], cards: [], expanded: null, steering: null, steerDraft: null, notes: [], standing: [], written: [],
   judge: { lastAtTokens: 0, lastAtTurn: 0, lastAtSeq: 0, lastAtMs: 0, running: false, runs: 0, spent: 0, backoff: 1, error: null, focus: null, time: null, context: null, last: null }, pendingCheck: false, paneOpen: false, autoOpened: false, columns: null, saved: { ms: 0, chars: 0 },
 })
 
@@ -278,6 +289,8 @@ export type Action =
   | { type: 'artifact.done'; patternId: string; kind: ArtifactKind; written: boolean }   // written: true once the rule is handled — written, tried or skipped — and recorded in state.written
   | { type: 'pane'; open: boolean; auto?: true }
   | { type: 'columns'; columns: number }
+  | { type: 'seen'; now: number }                            // every pattern this session found, matched or decided counts one more session
+  | { type: 'forget'; patternId: string | null }             // drops one pattern (null: all) from the session; the store is the shell's to rewrite
   | { type: 'reset' }
 
 /** Judge output after validation (section 5.3). */
@@ -741,40 +754,55 @@ Four gaps. None of them is a feature, and each is a reason to distrust the plugi
 
 ### 13.1 Portable tests and CI — WP-H1
 
-- `tests/register.test.ts`: the two expectations are built through a `posix(p)` helper local to the test
-  (`p.replaceAll('\\', '/')`) applied to both sides, not rewritten as Windows paths. No production change.
+- `tests/register.test.ts`: the engine resolves a path against the host's filesystem before a stub sees it,
+  so on Windows `/work/CLAUDE.md` reaches `fs.write` as `C:\work\CLAUDE.md`. The two expectations read the
+  stub's path through a `posix(p)` helper local to the test (`p.replace(/^[A-Za-z]:/, '').replaceAll('\\',
+  '/')`), not rewritten as Windows paths. No production change.
 - `scripts/appendix-a.ts` reports `MISMATCH` on a Windows checkout: `core.autocrlf` turns `docs/SPEC.md` into
-  CRLF and `fenced` splits on `\n`, so every line keeps a `\r`. `fenced` splits on `/\r?\n/`, and a
-  `.gitattributes` line `*.md text eol=lf` (with `*.ts`) keeps the repo's files LF on every checkout.
+  CRLF and `fenced` splits on `\n`, so every line keeps a `\r`. `fenced` splits on `/\r?\n/`, and
+  `.gitattributes` (`* text=auto eol=lf`, `*.png binary`) keeps the checkout LF everywhere. The index was
+  LF already, so no blob changes.
 - `.github/workflows/check.yml`: on push and pull request, matrix `ubuntu-latest`, `macos-latest`,
-  `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `npm i -g @anthropic-ai/claude-code@<the minimum
-  the README names>` (pinned, bumped with the README), then `bash scripts/check.sh` (`shell: bash`, so
-  Windows runs it under Git Bash). No secret: `validate`, `tsc` and `claude plugin test` run offline. If the
+  `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `actions/setup-node`, `npm i -g
+  @anthropic-ai/claude-code@2.1.280`, then `bash scripts/check.sh` (`shell: bash`, so Windows runs it under
+  Git Bash), then `scripts/appendix-a.ts`, which must print `IDENTICAL`. The pin is the release the suite
+  was verified on, bumped by hand. It is not the README's minimum (2.1.273): nobody has run the suite
+  against that one with the ops this version adds, and a job for it waits until somebody has. No secret:
+  `validate`, `tsc` and `claude plugin test` run offline. If the
   first run shows `claude plugin test` needs credentials, the job fails loud and this section is amended —
   a CI that skips the suite is worse than none.
-- README: the hard-coded `tests-279 passing` badge becomes the workflow's status badge. A count that
-  nobody updates is a claim that goes stale.
-- Acceptance: three green jobs; `claude plugin test .` on Windows passes every test.
+- README: the hard-coded tests badge becomes the workflow's status badge. On `main` it read `217 passing`
+  while the suite held 264: a count nobody updates is a claim that goes stale.
+- Acceptance: three green jobs; `claude plugin test .` on Windows passes every test (280 of 280 with this
+  section built).
 
 ### 13.2 `/saver patterns` and `/saver forget` — WP-H2
 
 `StoredPattern` gains `seen: { sessions: number; last: number }` — how many sessions found or matched it,
 and the clock of the last one. `parseRegistry` reads an entry without it as `{ sessions: 1, last: 0 }`.
-`persist` bumps `sessions` once per session per pattern (a session-only `State.counted: string[]` of the
-ids already bumped) and sets `last` to the clock.
+Every `persist` first dispatches `{ type: 'seen', now }`, which bumps `sessions` and sets `last` for each
+pattern this session had to do with (it has hits or a decision; a pattern only loaded from the store does
+not count) and that `State.counted: string[]` does not list yet, so a session counts once however often it
+persists. A pattern the judge mints starts at `{ sessions: 0, last: 0 }` and is counted at its first persist.
 
-- `/saver patterns` prints the project's stored registry (the key of §13.3), newest `last` first, capped
-  at `DEBUG_MAX_LINES`: `n · id · kind (cut to the width) · last decision · ×sessions · YYYY-MM-DD`. Dates
+- `/saver patterns` persists, then prints the project's stored registry (the key of §13.3), newest `last`
+  first, capped at `DEBUG_MAX_LINES`: `n · id · kind (cut to the width) · last decision · ×sessions · YYYY-MM-DD`. Dates
   are ISO, like the numbers of §12.6: a format `/saver` reads back is one format.
-- `/saver forget <n|id>` removes the pattern from `state.patterns`, `state.cards` and `state.standing`, and
-  from the store by a read-filter-write of the key (not `persist`: `mergeStored` is a union and would
+- `/saver forget <n|id>` (`n` as `/saver patterns` numbers them, after the same persist) removes the
+  pattern from `state.patterns`, `state.cards` and the pane's open details or `Fix…` field, and from the
+  store by a read-filter-write of the key. What this session already sent stays sent: a standing
+  instruction is not recalled (not `persist`: `mergeStored` is a union and would
   write it back). `/saver forget all` is `$.store.delete(key)` plus the same in state.
 - Forget is not Ignore. It wipes the memory; the judge is free to find the behaviour again. A person who
   never wants it again ignores it, and a stored `keep` is already off limits to the judge (Appendix A,
   DECISIONS).
 - `COMMAND.description` and `argumentHint` gain both subcommands; the subcommand words are not translated
-  (§12.1). `say/en.ts` gains `command.patternsEmpty`, `command.patternLine(…)`, `command.forgot(id)`,
-  `command.forgetUsage`; other languages may leave them to the English fallback.
+  (§12.1). On `main` the replies are constants in `register.ts` beside `SAVER_USAGE` (`FORGET_USAGE`, the
+  forgot and no-such lines) and `core/memory.ts` (`registryLines`). When §12 lands they move to `say/en.ts`
+  as `command.*`, and other languages may leave them to the English fallback.
+- `core/memory.ts` (new, pure) holds what this section and the next compute: `keyPath`, `projectKeyOf`,
+  `registryKey`, `parseProjects`, `evictions`, `isoDay` (the civil date computed from the clock, since
+  `Date` is not the plugin's), `listed`, `namedIn`, `registryLines`. Tested in `tests/memory.test.ts`.
 - Tests: `tests/register.test.ts` (list; forget by number, by id, `all`; an unknown id answers the usage;
   a forgotten pattern is not written back by the next `persist`); `tests/patterns.test.ts` (`seen` bumped
   once per session, old entries parsed).
@@ -794,7 +822,9 @@ ids already bumped) and sets `last` to the clock.
   updated at `session.start`. Then, if the summed JSON length of every `patterns:*` key
   (`$.store.keys()`) exceeds `STORE_SOFT_CAP = 3 * 1024 * 1024`, the least recently used keys are deleted
   (`$.store.delete`) until it does not. The current project is never evicted. Keys absent from `projects`
-  (pre-v0.6) count as used at 0, so they go first.
+  (pre-v0.6) count as used at 0, so they go first. The index keeps only keys the store still holds. All of
+  this runs detached after the load (`tidyStore`), since a store that cannot be tidied costs the session
+  nothing.
 - Tests: key from a stubbed `process.run` for a worktree and for the main checkout (same key); fallback on
   a non-zero exit; migration; eviction order and the current project spared.
 
@@ -806,15 +836,21 @@ and prompt cache, which is what makes it cheap. A smaller model through `$.model
 input than the fork it replaced. **Rejected**; the lever is the budget.
 
 - Manifest: `userConfig.auditBudget`, `type: "number"` (`ConfigKind` has `number`, d.ts 1430), default `3`,
-  a percentage of the session's tokens; `0` means the audit runs only on `/saver check`. Read from
-  `options.auditBudget` in `register.ts` and nowhere else, like the language. `JUDGE_BUDGET_SHARE` becomes
-  the default.
-- `shouldRun` gains a hard stop: the automatic lanes return false while `spent > 2 × share × total`. The
-  soft brake (backoff) stays as it is below that. `/saver check` always runs: the person asked.
-- The first time a session hits the stop, one toast: `say().band.auditPaused(pct)`; `/saver debug`'s judge
-  line gains `paused (budget)`.
+  a percentage of the session's tokens; `0` means the audit runs only on `/saver check`. `register(on,
+  options)` reads `options.auditBudget` once, as a number or a numeric string, capped at
+  `JUDGE_BUDGET_MAX = 0.5`; anything else is the default, `JUDGE_BUDGET_SHARE`. It lands in `State.budget`,
+  so `shouldRun`, the backoff and `/saver debug` stay pure functions of the state and `reset` keeps it.
+- `shouldRun` gains a hard stop (`budgetStopped`, `JUDGE_STOP_FACTOR = 2`): the automatic lanes return
+  false while `spent > 2 × share × total`, and always at a budget of 0. The soft brake (backoff, now
+  against `state.budget`) stays as it is below that. `/saver check` always runs: the person asked. The stop
+  is a share, not a sum, so a session that keeps growing brings the audit back under it and the cadence
+  resumes.
+- The first time a session's lanes find the stop, one toast: `ContextSaver: the audit paused at <share> of
+  this session's tokens (it stops past <2 × budget>) — /saver check still runs`. `/saver debug`'s judge
+  line gains `budget 3% · stops at 6%`, then `· paused (budget)` while stopped, or `budget on request only`
+  at 0.
 - Tests: `tests/judge.test.ts` (`shouldRun` at, below and above the stop; `0`); `tests/register.test.ts`
-  (a manual check runs past the stop; the toast once).
+  (the toast once; a manual check runs past the stop; the audit resumes once the session outgrows it).
 
 ### 13.5 Not built in v0.6
 

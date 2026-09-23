@@ -6,7 +6,8 @@ import { JUDGE_PROMPT } from '../hooks/core/judge.ts'
 
 // The prompt itself contains a nested ```json fence, so take the LAST ``` before the next `## Appendix` heading.
 const fenced = (path: string): string => {
-  const lines = readFileSync(path, 'utf8').split('\n')
+  // A Windows checkout may hand the file over with CRLF endings; the prompt's own lines never carry a `\r`.
+  const lines = readFileSync(path, 'utf8').split(/\r?\n/)
   const head = lines.findIndex(l => l.startsWith('## Appendix A'))
   const tail = lines.findIndex((l, i) => i > head && l.startsWith('## Appendix B'))
   const open = lines.findIndex((l, i) => i > head && l.startsWith('```text'))

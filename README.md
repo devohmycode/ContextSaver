@@ -4,7 +4,7 @@
 
 **Catches what's bogging down your Claude Code session and lets you fix it in one click.**
 
-[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-5769F7)](https://claude.com/claude-code) [![tests](https://img.shields.io/badge/tests-217%20passing-3fb950)](scripts/check.sh) [![dependencies](https://img.shields.io/badge/dependencies-0-3fb950)](#development) [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-5769F7)](https://claude.com/claude-code) [![check](https://github.com/AlmogBaku/ContextSaver/actions/workflows/check.yml/badge.svg)](.github/workflows/check.yml) [![dependencies](https://img.shields.io/badge/dependencies-0-3fb950)](#development) [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
 
@@ -82,6 +82,8 @@ waiting for your next prompt.
 | `/saver fix <n>` | Send card `n`'s suggested fix. |
 | `/saver fix [n] <text>` | Send your own instruction instead. Without a number: the open card, else card 1. |
 | `/saver ignore <n>` | Drop card `n` for the rest of the session. |
+| `/saver patterns` | List what the plugin learned about this project, numbered, newest first. |
+| `/saver forget <n\|id\|all>` | Forget one learned pattern, or all of them. The audit may find it again. |
 | `/saver debug` | Print the session state: ledger, findings, decisions, what the audit cost, savings. |
 | `/saver reset` | Clear this session's ledger and decisions. Learned patterns survive. |
 
@@ -103,13 +105,18 @@ product spec is [`docs/PRD.md`](docs/PRD.md).
 ## Notes and limits
 
 > [!IMPORTANT]
-> The audit runs on your session's model, so a session on Opus pays Opus for it. It keeps itself to a few
-> percent of the session's tokens, and `/saver debug` shows exactly what it spent.
+> The audit runs on your session's model, so a session on Opus pays Opus for it. It keeps itself to 3% of
+> the session's tokens and stops past twice that, saying so once; `/saver check` always runs. `/config` →
+> **ContextSaver** → **Audit budget** moves the share (`0`: only when you ask), and `/saver debug` shows
+> exactly what it spent.
 
 - **Early access.** Function hooks are new and the API underneath can still change. Every module is
   tested and the main flow is verified live, but expect rough edges.
 - **Short sessions stay quiet.** Under ~15 tool calls or 5 turns, only behaviour seen three or more times
   is reported.
+- **What it learns is kept per repository.** Every worktree of a repository shares one memory; a folder
+  that is not a repository keeps its own. When the store fills, the projects you have not opened for the
+  longest are forgotten first.
 - **Durations are wall time.** They include the time a permission prompt spent waiting for you, and the
   model is told as much.
 - **Terminal and desktop only.** On mobile surfaces the plugin keeps its ledger and draws nothing.

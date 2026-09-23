@@ -2,7 +2,7 @@ import type { ModelForkUsage } from 'claude-code'
 
 import { agentsBlock, decisionsBlock, knownPatternsBlock, ledgerBlock, sinksBlock, statsLines, turnsBlock } from './blocks'
 import { agentAliases } from './evidence'
-import { totalTokens } from './patterns'
+import { budgetStopped, totalTokens } from './patterns'
 import { collapseWs, median } from './text'
 import {
   ALTERNATIVE_MAX, JUDGE_LEDGER_ROWS, JUDGE_MIN_GAP_MS, JUDGE_MIN_NEW_ROWS, JUDGE_MIN_NEW_TOKENS,
@@ -140,13 +140,15 @@ const rowGate = (state: State, now: number): boolean =>
   now - state.judge.lastAtMs >= JUDGE_MIN_GAP_MS
 
 /**
- * True when the cadence gates allow another judge run.
+ * True when the cadence gates allow another judge run and the audit is within its budget (§13.4).
  *
  * @param state the session so far
  * @param now the clock, for the gap the mid-turn gate keeps between runs
  */
 export const shouldRun = (state: State, now: number): boolean =>
   !state.judge.running &&
+  state.budget > 0 &&
+  !budgetStopped(state) &&
   state.rows.length >= JUDGE_MIN_ROWS &&
   (turnGate(state) || rowGate(state, now))
 
@@ -434,7 +436,7 @@ export const parseReply = (text: string, state: State, aliases: ReadonlyMap<stri
 const patternOf = (f: Finding): Pattern => ({
   id: f.id, category: f.category, kind: f.kind, signature: f.signature, why: f.why,
   alternative: f.alternative, confidence: f.confidence, proposal: f.proposal,
-  estTokensPerTurn: f.estTokensPerTurn, lastDecision: null,
+  estTokensPerTurn: f.estTokensPerTurn, lastDecision: null, seen: { sessions: 0, last: 0 },
   hits: [...f.evidence], decision: null, decidedAtTurn: null, instruction: null, openedAtTurn: null, ignored: 0,
 })
 

@@ -3,6 +3,8 @@ import type {
   ModelForkResult,
   PaneCloseArgs,
   PaneOpenArgs,
+  ProcessRunInit,
+  ProcessRunResult,
   SessionMessage,
   SessionUsage,
   SessionUsageArgs,
@@ -38,6 +40,12 @@ export type Host = {
   storeGet(key: string): Promise<unknown>
   /** $.store.set(key, v) — write a value to the plugin store. */
   storeSet(key: string, v: unknown): Promise<void>
+  /** $.store.delete(key) — remove a key from the plugin store. */
+  storeDelete(key: string): Promise<void>
+  /** $.store.keys() — every key the plugin store holds. */
+  storeKeys(): Promise<string[]>
+  /** $.process.run(argv, init) — run a command by its argument vector, no shell. */
+  run(argv: readonly string[], init?: ProcessRunInit): Promise<ProcessRunResult>
   /** $.model.fork({ prompt }) — run a detached model completion over the session transcript. */
   fork(prompt: string): Promise<ModelForkResult | null>
   /** $.fs.read(p) — read a file as a string. */

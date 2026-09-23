@@ -7,13 +7,15 @@ export const PANE_INLINE_ROWS = 18            // body rows requested when seated
 export const AUTO_OPEN_MIN_COLUMNS = 144      // unasked opens wait undrawn below this width (d.ts 1943-1945)
 export const STEER_RING_TRIES = 8             // frames the Fix… field's ring is asked for before the composer route is said
 export const STEER_RING_WAIT_MS = 40          // a frame and a little: the shown pane redraws at most thirty times a second
-export const COMMAND = { name: 'saver', description: 'ContextSaver: toggle the pane · check | fix [n] [text] | ignore <n> | debug | reset', argumentHint: '[check | fix [n] [text] | ignore <n> | debug | reset]' } as const
+export const COMMAND = { name: 'saver', description: 'ContextSaver: toggle the pane · check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset', argumentHint: '[check | fix [n] [text] | ignore <n> | patterns | forget <n|id|all> | debug | reset]' } as const
 export const SETTLE_TURNS = 2                 // an instruction not ignored for this many turns is credited
 export const JUDGE_MIN_NEW_TOKENS = 30_000
 export const JUDGE_MIN_TURNS = 3
 export const JUDGE_MIN_ROWS = 8
 export const JUDGE_MAX_BACKOFF = 4
-export const JUDGE_BUDGET_SHARE = 0.03
+export const JUDGE_BUDGET_SHARE = 0.03          // the audit's default share of the session's tokens; `auditBudget` in /config overrides it
+export const JUDGE_BUDGET_MAX = 0.5            // the highest share `auditBudget` may set
+export const JUDGE_STOP_FACTOR = 2             // past this many times its share, the automatic audit stops; `/saver check` still runs
 export const JUDGE_LEDGER_ROWS = 150          // full rows rendered; older rows are folded into `~` summary lines
 export const MAX_FINDINGS = 6
 export const MAX_BEHAVIORAL_FINDINGS = 3      // findings with signature: null per judge run (agent findings are signature-null too)
@@ -40,6 +42,11 @@ export const LOOP_CAP = 400                   // loops kept (oldest dropped)
 export const AGENTS_ROWS = 60                 // loop lines the AGENTS block renders in full; older ones fold per run
 export const RUN_REFRESH_MS = 10_000          // a running workflow's journal is re-read at most this often
 export const RUN_FRESH_MS = 600_000           // a run with no loop yet counts as active this long after its launch
+export const PATTERNS_KEY = 'patterns:'       // store key prefix of one project's registry
+export const PROJECTS_KEY = 'projects'        // store key: each registry key's last session, for eviction
+export const STORE_SOFT_CAP = 3 * 1024 * 1024 // summed JSON length of every registry past which the least recently used are evicted (the store holds 4 MiB)
+export const GIT_TIMEOUT_MS = 2_000           // the project key's `git rev-parse`; past it the key is the folder
+export const LIST_KIND = 60                   // characters of a behaviour `/saver patterns` prints
 
 export type CommandClass = 'test' | 'lint' | 'format' | 'typecheck' | 'build' | 'install' | 'git' | 'read' | 'search' | 'other'
 export type Category = 'execution' | 'reading' | 'production' | 'behavior' | 'communication' | 'multi-agent' | 'environment' | 'process' | 'other'
@@ -82,6 +89,7 @@ export type StoredPattern = {
   proposal: Proposal | null
   estTokensPerTurn: number | null  // judge's estimate for behavioural patterns; null when a signature exists
   lastDecision: Choice | null      // the most recent session's decision, for the judge's calibration
+  seen: { sessions: number; last: number }   // sessions that found, matched or decided it, and the clock of the last one (0 unknown)
 }
 /** Session-only fields. */
 export type Pattern = StoredPattern & {
@@ -124,6 +132,9 @@ export type Usage = { tokens?: number; window: number; percent?: number; compact
 
 export type State = {
   cwd: string
+  projectKey: string               // the registry's store key without its prefix: the repository's root for every worktree of it, else the folder
+  budget: number                   // the audit's share of the session's tokens: past it the cadence slows, past JUDGE_STOP_FACTOR times it the automatic audit stops; 0 = only on /saver check
+  counted: string[]                // pattern ids whose `seen.sessions` this session already bumped
   turn: number
   seq: number                      // last Row.seq issued
   rows: Row[]                      // capped at ROW_CAP (oldest dropped)
@@ -151,7 +162,7 @@ export type State = {
 }
 
 export const initialState = (cwd: string, window: number): State => ({
-  cwd, turn: 0, seq: 0, rows: [], folded: {}, turns: [], loops: [], runs: [], usage: { window }, overhead: null, compactions: [], patterns: [], cards: [], expanded: null, steering: null, steerDraft: null, notes: [], standing: [], written: [],
+  cwd, projectKey: cwd, budget: JUDGE_BUDGET_SHARE, counted: [], turn: 0, seq: 0, rows: [], folded: {}, turns: [], loops: [], runs: [], usage: { window }, overhead: null, compactions: [], patterns: [], cards: [], expanded: null, steering: null, steerDraft: null, notes: [], standing: [], written: [],
   judge: { lastAtTokens: 0, lastAtTurn: 0, lastAtSeq: 0, lastAtMs: 0, running: false, runs: 0, spent: 0, backoff: 1, error: null, focus: null, time: null, context: null, last: null }, pendingCheck: false, paneOpen: false, autoOpened: false, columns: null, saved: { ms: 0, chars: 0 },
 })
 
@@ -179,6 +190,8 @@ export type Action =
   | { type: 'artifact.done'; patternId: string; kind: ArtifactKind; written: boolean }   // written: true once the rule is handled — written, tried or skipped — and recorded in state.written
   | { type: 'pane'; open: boolean; auto?: true }
   | { type: 'columns'; columns: number }
+  | { type: 'seen'; now: number }                            // every pattern this session found, matched or decided counts one more session
+  | { type: 'forget'; patternId: string | null }             // drops one pattern (null: all) from the session; the store is the shell's to rewrite
   | { type: 'reset' }
 
 /** Judge output after validation (section 5.3). */
