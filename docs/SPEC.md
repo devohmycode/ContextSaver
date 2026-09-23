@@ -718,6 +718,111 @@ Agent facts in the pane header; a size for a spawn whose loop never reaches `tur
 
 ---
 
+## 13. v0.6 — A green suite everywhere, a memory you can see
+
+### 13.0 Why
+
+Four gaps. None of them is a feature, and each is a reason to distrust the plugin.
+
+1. **The suite is green on one machine.** The README says `279 passing`; on Windows `tests/register.test.ts`
+   fails twice, because two expectations are written as POSIX paths (`/tmp/runs/w3/journal.jsonl`,
+   `/work/CLAUDE.md`) while the code under test builds `C:\tmp\runs\w3\journal.jsonl`. The code is right and
+   the test is not portable. Nothing runs `scripts/check.sh` but its author, so this only surfaced by chance.
+2. **What the plugin learned is invisible.** `/saver reset` keeps the stored patterns on purpose, and no
+   command lists them. A pattern the person disagrees with — a signature that matched the wrong thing —
+   comes back every session, and the only way out is deleting the whole store by hand.
+3. **The memory is keyed by folder.** `patterns:${cwd}`: every worktree of a repository and every
+   subfolder Claude Code was started in starts from zero. The store is 4 MiB for every project on the
+   machine (§9.10) and nothing ever evicts a project, so a long-lived machine eventually fills it and
+   `persist`'s write fails silently.
+4. **The audit's budget is a soft brake.** Past `JUDGE_BUDGET_SHARE` of the session's tokens the cadence
+   doubles (`backoff`, up to `JUDGE_MAX_BACKOFF`), but it never stops, and the person has no say in the
+   share. A session on Opus pays Opus for every audit.
+
+### 13.1 Portable tests and CI — WP-H1
+
+- `tests/register.test.ts`: the two expectations are built through a `posix(p)` helper local to the test
+  (`p.replaceAll('\\', '/')`) applied to both sides, not rewritten as Windows paths. No production change.
+- `scripts/appendix-a.ts` reports `MISMATCH` on a Windows checkout: `core.autocrlf` turns `docs/SPEC.md` into
+  CRLF and `fenced` splits on `\n`, so every line keeps a `\r`. `fenced` splits on `/\r?\n/`, and a
+  `.gitattributes` line `*.md text eol=lf` (with `*.ts`) keeps the repo's files LF on every checkout.
+- `.github/workflows/check.yml`: on push and pull request, matrix `ubuntu-latest`, `macos-latest`,
+  `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `npm i -g @anthropic-ai/claude-code@<the minimum
+  the README names>` (pinned, bumped with the README), then `bash scripts/check.sh` (`shell: bash`, so
+  Windows runs it under Git Bash). No secret: `validate`, `tsc` and `claude plugin test` run offline. If the
+  first run shows `claude plugin test` needs credentials, the job fails loud and this section is amended —
+  a CI that skips the suite is worse than none.
+- README: the hard-coded `tests-279 passing` badge becomes the workflow's status badge. A count that
+  nobody updates is a claim that goes stale.
+- Acceptance: three green jobs; `claude plugin test .` on Windows passes every test.
+
+### 13.2 `/saver patterns` and `/saver forget` — WP-H2
+
+`StoredPattern` gains `seen: { sessions: number; last: number }` — how many sessions found or matched it,
+and the clock of the last one. `parseRegistry` reads an entry without it as `{ sessions: 1, last: 0 }`.
+`persist` bumps `sessions` once per session per pattern (a session-only `State.counted: string[]` of the
+ids already bumped) and sets `last` to the clock.
+
+- `/saver patterns` prints the project's stored registry (the key of §13.3), newest `last` first, capped
+  at `DEBUG_MAX_LINES`: `n · id · kind (cut to the width) · last decision · ×sessions · YYYY-MM-DD`. Dates
+  are ISO, like the numbers of §12.6: a format `/saver` reads back is one format.
+- `/saver forget <n|id>` removes the pattern from `state.patterns`, `state.cards` and `state.standing`, and
+  from the store by a read-filter-write of the key (not `persist`: `mergeStored` is a union and would
+  write it back). `/saver forget all` is `$.store.delete(key)` plus the same in state.
+- Forget is not Ignore. It wipes the memory; the judge is free to find the behaviour again. A person who
+  never wants it again ignores it, and a stored `keep` is already off limits to the judge (Appendix A,
+  DECISIONS).
+- `COMMAND.description` and `argumentHint` gain both subcommands; the subcommand words are not translated
+  (§12.1). `say/en.ts` gains `command.patternsEmpty`, `command.patternLine(…)`, `command.forgot(id)`,
+  `command.forgetUsage`; other languages may leave them to the English fallback.
+- Tests: `tests/register.test.ts` (list; forget by number, by id, `all`; an unknown id answers the usage;
+  a forgotten pattern is not written back by the next `persist`); `tests/patterns.test.ts` (`seen` bumped
+  once per session, old entries parsed).
+
+### 13.3 One memory per repository, bounded machine-wide — WP-H3
+
+- **Key.** At `session.start`, `projectKeyOf` runs `git rev-parse --path-format=absolute --git-common-dir`
+  through `$.process.run` (a new `Host.run(argv)`; `claude plugin test` requires the op to be literally
+  called, §11.4). The common dir is the main repository's `.git` for every worktree, so its parent is one
+  key for all of them. Normalised: forward slashes, a lowercase drive letter. Not a repository, git
+  missing, or a timeout of 2 s: `cwd`, as today. `State` gains `projectKey`; `persist`, `/saver patterns`
+  and `/saver forget` use it. `rules.ts` keeps writing under `state.cwd`: a CLAUDE.md belongs to the
+  worktree the person is in.
+- **Migration.** When `patterns:${projectKey}` is empty and `patterns:${cwd}` is not, the load merges the
+  second into the first (`mergeStored`) and writes it. The old key is left to eviction.
+- **Eviction.** A store key `projects: Record<string, number>` maps each key to its last session's clock,
+  updated at `session.start`. Then, if the summed JSON length of every `patterns:*` key
+  (`$.store.keys()`) exceeds `STORE_SOFT_CAP = 3 * 1024 * 1024`, the least recently used keys are deleted
+  (`$.store.delete`) until it does not. The current project is never evicted. Keys absent from `projects`
+  (pre-v0.6) count as used at 0, so they go first.
+- Tests: key from a stubbed `process.run` for a worktree and for the main checkout (same key); fallback on
+  a non-zero exit; migration; eviction order and the current project spared.
+
+### 13.4 A hard cap on what the audit spends — WP-H4
+
+`$.model.fork` takes no model (d.ts 4149: `ModelForkRequest = { prompt }`): it shares the session's model
+and prompt cache, which is what makes it cheap. A smaller model through `$.model.complete({ model:
+'haiku' })` would lose the transcript and the cache, and pasting the transcript into it would cost more
+input than the fork it replaced. **Rejected**; the lever is the budget.
+
+- Manifest: `userConfig.auditBudget`, `type: "number"` (`ConfigKind` has `number`, d.ts 1430), default `3`,
+  a percentage of the session's tokens; `0` means the audit runs only on `/saver check`. Read from
+  `options.auditBudget` in `register.ts` and nowhere else, like the language. `JUDGE_BUDGET_SHARE` becomes
+  the default.
+- `shouldRun` gains a hard stop: the automatic lanes return false while `spent > 2 × share × total`. The
+  soft brake (backoff) stays as it is below that. `/saver check` always runs: the person asked.
+- The first time a session hits the stop, one toast: `say().band.auditPaused(pct)`; `/saver debug`'s judge
+  line gains `paused (budget)`.
+- Tests: `tests/judge.test.ts` (`shouldRun` at, below and above the stop; `0`); `tests/register.test.ts`
+  (a manual check runs past the stop; the toast once).
+
+### 13.5 Not built in v0.6
+
+A model choice for the audit (§13.4); syncing the memory between machines; localised dates in `/saver
+patterns`.
+
+---
+
 ## Appendix A — The judge prompt (verbatim; `JUDGE_PROMPT` in `core/judge.ts`)
 
 Merged from the synthesized draft and both critics' revisions; every column it names exists in `Row`/`TurnStat`/`KeyStat` (sections 4, 5.1) and is rendered by `buildPrompt` (section 5.3). Static part ≈ 3,050 words (whitespace-separated) / ≈ 19 kB.
