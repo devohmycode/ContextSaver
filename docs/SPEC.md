@@ -763,14 +763,13 @@ Four gaps. None of them is a feature, and each is a reason to distrust the plugi
   `.gitattributes` (`* text=auto eol=lf`, `*.png binary`) keeps the checkout LF everywhere. The index was
   LF already, so no blob changes.
 - `.github/workflows/check.yml`: on a push to any branch and on pull requests, matrix `ubuntu-latest`, `macos-latest`,
-  `windows-latest`; steps: checkout, `oven-sh/setup-bun`, `actions/setup-node`, `npm i -g
+  `windows-latest`; steps: `actions/checkout`, `oven-sh/setup-bun`, `actions/setup-node`, `npm i -g
   @anthropic-ai/claude-code@2.1.280`, then `bash scripts/check.sh` (`shell: bash`, so Windows runs it under
   Git Bash), then `scripts/appendix-a.ts`, which exits 1 on a `MISMATCH`. The pin is the release the suite
   was verified on, bumped by hand. It is not the README's minimum (2.1.273): nobody has run the suite
   against that one with the ops this version adds, and a job for it waits until somebody has. No secret:
-  `validate`, `tsc` and `claude plugin test` run offline. If the
-  first run shows `claude plugin test` needs credentials, the job fails loud and this section is amended —
-  a CI that skips the suite is worse than none.
+  `validate`, `tsc` and `claude plugin test` run offline, as the first runs on the fork confirmed.
+  `actions/checkout` and `actions/setup-node` are at `v7`, which run on Node 24.
 - README: the hard-coded tests badge becomes the workflow's status badge. On `main` it read `217 passing`
   while the suite held 264: a count nobody updates is a claim that goes stale.
 - Acceptance: three green jobs; `claude plugin test .` on Windows passes every test (280 of 280 with this
