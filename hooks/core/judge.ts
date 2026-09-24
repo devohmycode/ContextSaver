@@ -449,8 +449,10 @@ const patternOf = (f: Finding): Pattern => ({
   hits: [...f.evidence], decision: null, decidedAtTurn: null, instruction: null, openedAtTurn: null, ignored: 0,
 })
 
+// The title is the finding's too: a pattern remembered from a session in another language would
+// otherwise keep its old words above a `why` and a fix written in the language chosen now.
 const updatedWith = (p: Pattern, f: Finding): Pattern => ({
-  ...p, why: f.why, alternative: f.alternative, proposal: f.proposal, confidence: f.confidence,
+  ...p, kind: f.kind, why: f.why, alternative: f.alternative, proposal: f.proposal, confidence: f.confidence,
   estTokensPerTurn: f.estTokensPerTurn, hits: unique([...p.hits, ...f.evidence]),
 })
 
